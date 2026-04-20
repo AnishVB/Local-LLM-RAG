@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BDL Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <main class="dashboard-shell">
+      <header class="topbar card glass">
+        <div>
+          <p class="eyebrow">Local LLM RAG</p>
+          <h1>BDL Intelligence Dashboard</h1>
+        </div>
+        <button class="primary-btn" type="button">Sync Knowledge Base</button>
+      </header>
+
+      <section class="kpi-grid">
+        <article class="kpi-card card">
+          <p class="kpi-label">Indexed Documents</p>
+          <p class="kpi-value">--</p>
+          <p class="kpi-trend neutral">No data yet</p>
+        </article>
+        <article class="kpi-card card">
+          <p class="kpi-label">Questions Answered</p>
+          <p class="kpi-value">--</p>
+          <p class="kpi-trend neutral">No data yet</p>
+        </article>
+        <article class="kpi-card card">
+          <p class="kpi-label">Average Latency</p>
+          <p class="kpi-value">--</p>
+          <p class="kpi-trend neutral">No data yet</p>
+        </article>
+        <article class="kpi-card card">
+          <p class="kpi-label">Model Status</p>
+          <p class="kpi-value">Idle</p>
+          <p class="kpi-trend neutral">Waiting for first run</p>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="card panel">
+          <h2>Recent Queries</h2>
+          <p class="empty-state">
+            No queries yet. Start chatting to see query history here.
+          </p>
+        </article>
+
+        <article class="card panel">
+          <h2>Pipeline Activity</h2>
+          <p class="empty-state">
+            No pipeline events yet. Run indexing to populate activity logs.
+          </p>
+        </article>
+      </section>
+
+      <section class="card panel chatbot-panel">
+        <h2>Chatbot</h2>
+        <div class="chat-window">
+          <div class="chat-log" aria-live="polite">
+            <p class="chat-bubble bot">
+              Chat window is ready. Ask a question about your documents.
+            </p>
+          </div>
+          <form class="chat-input-row" action="#" method="get">
+            <label class="sr-only" for="chat-input">Ask a question</label>
+            <input
+              id="chat-input"
+              name="q"
+              type="text"
+              placeholder="Type your question..."
+            />
+            <button class="primary-btn" type="submit">Send</button>
+          </form>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
