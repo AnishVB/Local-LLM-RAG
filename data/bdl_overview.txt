@@ -1,2 +1,0 @@
-BDL is an organization focused on data and business intelligence solutions.
-This is starter content for local RAG testing. Replace with real files in data/.
