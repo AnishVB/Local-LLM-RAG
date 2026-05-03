@@ -1,0 +1,8 @@
+numpy
+ollama
+python-dotenv
+rich
+pymupdf
+lancedb
+pyarrow
+tantivy

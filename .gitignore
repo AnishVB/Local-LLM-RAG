@@ -1,8 +1,11 @@
 # Ignore the database folder
-librarian_db/
+document_db/
 
 # Ignore environment variables (crucial for security)
 .env
 
 # Ignore Python cache
 __pycache__/
+
+# Ignore chat history
+chat_history/
