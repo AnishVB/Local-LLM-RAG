@@ -22,6 +22,7 @@ PAGE NUMBER CONVENTION (important):
 import os
 import re
 import json
+import threading
 import numpy as np
 import ollama
 import fitz  # PyMuPDF
@@ -49,12 +50,13 @@ QA_TABLE_NAME = "qa_cache"
 
 # ── LanceDB Schemas ──────────────────────────────────────────────────────────
 LANCE_SCHEMA = pa.schema([
-    pa.field("text",     pa.utf8()),
-    pa.field("source",   pa.utf8()),
-    pa.field("page",     pa.int32()),
-    pa.field("chunk_id", pa.int32()),
-    pa.field("heading",  pa.utf8()),
-    pa.field("vector",   pa.list_(pa.float32(), EMBED_DIM)),
+    pa.field("text",      pa.utf8()),
+    pa.field("source",    pa.utf8()),
+    pa.field("page",      pa.int32()),
+    pa.field("chunk_id",  pa.int32()),
+    pa.field("heading",   pa.utf8()),
+    pa.field("file_path", pa.utf8()),   # absolute path to the original file on disk
+    pa.field("vector",    pa.list_(pa.float32(), EMBED_DIM)),
 ])
 
 QA_SCHEMA = pa.schema([
@@ -67,6 +69,30 @@ QA_SCHEMA = pa.schema([
 
 # QA cache similarity threshold: how close a question must be to reuse a cached answer
 QA_CACHE_THRESHOLD = 0.93
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL-injection guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sanitise_source(name: str) -> str:
+    """
+    Return a version of *name* that is safe to embed in a LanceDB
+    SQL WHERE clause string literal.
+
+    LanceDB uses Apache DataFusion SQL.  Single-quote is the only
+    character that can break out of a string literal; we escape it by
+    doubling it (standard SQL escaping).  We also strip the ASCII NUL
+    byte, which DataFusion rejects.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"source filter must be a str, got {type(name)}")
+    return name.replace("\x00", "").replace("'", "''")
+
+
+def _where_source(name: str) -> str:
+    """Return a safe ``source = '…'`` WHERE clause fragment."""
+    return f"source = '{_sanitise_source(name)}'"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,14 +309,34 @@ def _embed_cached(text: str) -> tuple:
     """
     Embed text using Ollama's nomic-embed-text model.
     Returns a tuple (hashable, so it can be cached by lru_cache).
-    Falls back to a shorter prompt if the full text fails.
+
+    Raises OllamaConnectionError (a RuntimeError) when Ollama is
+    unreachable so callers can surface a clear message to the user
+    instead of swallowing a silent failure.
     """
     safe = text.strip()[:EMBED_LIMIT] or " "
     try:
         return tuple(ollama.embeddings(model=EMBED_MODEL, prompt=safe)["embedding"])
-    except Exception:
-        # Retry with truncated text in case the full length caused an error
-        return tuple(ollama.embeddings(model=EMBED_MODEL, prompt=safe[:200])["embedding"])
+    except ollama.ResponseError as e:
+        # Model-level error (e.g. model not pulled); re-raise with context
+        raise RuntimeError(
+            f"Ollama model '{EMBED_MODEL}' returned an error: {e}. "
+            "Run `ollama pull nomic-embed-text` to install it."
+        ) from e
+    except Exception as e:
+        # Covers httpx.ConnectError, ConnectionRefusedError, etc.
+        msg = str(e).lower()
+        if any(kw in msg for kw in ("connection", "connect", "refused", "timeout", "unreachable")):
+            raise RuntimeError(
+                "Cannot reach Ollama. Make sure Ollama is running "
+                "(`ollama serve`) and accessible."
+            ) from e
+        # Any other unexpected error — retry with a shorter prompt once,
+        # then surface the error rather than silently returning garbage.
+        try:
+            return tuple(ollama.embeddings(model=EMBED_MODEL, prompt=safe[:200])["embedding"])
+        except Exception as e2:
+            raise RuntimeError(f"Embedding failed: {e2}") from e2
 
 def _embed(text: str) -> list:
     """Convenience wrapper: embed text and return as a plain list."""
@@ -321,6 +367,7 @@ class ChatbotDB:
         self._table = None
         self._qa_table = None
         self._chunks_cache = None   # Lazy cache for .chunks property
+        self._write_lock = threading.Lock()  # Thread-safety for multi-user writes
         self._open_or_create_table()
         self._open_or_create_qa_table()
 
@@ -378,10 +425,11 @@ class ChatbotDB:
                 result.append({
                     "text": row["text"],
                     "meta": {
-                        "source":   row["source"],
-                        "page":     int(row["page"]),
-                        "chunk_id": int(row["chunk_id"]),
-                        "heading":  row["heading"],
+                        "source":    row["source"],
+                        "page":      int(row["page"]),
+                        "chunk_id":  int(row["chunk_id"]),
+                        "heading":   row["heading"],
+                        "file_path": row.get("file_path", ""),
                     }
                 })
             self._chunks_cache = result
@@ -400,14 +448,35 @@ class ChatbotDB:
 
         Returns the number of chunks added.
         progress_cb(done, total) is called every 50 chunks.
+        Thread-safe: uses _write_lock for concurrent access.
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
+        # ── Validation ────────────────────────────────────────────────────────
+        MAX_FILE_BYTES = 200 * 1024 * 1024  # 200 MB hard cap
+        ALLOWED_SUFFIXES = {".pdf", ".txt", ".md"}
+
         ext  = Path(file_path).suffix.lower()
         name = Path(file_path).name
 
-        # Extract text based on file type
+        if ext not in ALLOWED_SUFFIXES:
+            raise ValueError(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed types: {', '.join(sorted(ALLOWED_SUFFIXES))}"
+            )
+
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            raise ValueError("File is empty (0 bytes).")
+        if file_size > MAX_FILE_BYTES:
+            raise ValueError(
+                f"File too large: {file_size / (1024*1024):.1f} MB. "
+                f"Maximum allowed size is {MAX_FILE_BYTES // (1024*1024)} MB."
+            )
+        # ── End validation ────────────────────────────────────────────────────
+
+        # Extract text based on file type (CPU-bound, outside lock)
         if ext == ".pdf":
             pages = _extract_pdf(file_path)
             if not pages:
@@ -420,18 +489,14 @@ class ChatbotDB:
         elif ext in (".txt", ".md"):
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 raw_chunks = _chunk_page(_clean(f.read()), name, 0, "")
-        else:
-            raise ValueError("Unsupported format — use .pdf, .txt, or .md")
+        # No else needed — ext validated above
 
         # Filter out any empty chunks that slipped through
         raw_chunks = [c for c in raw_chunks if c and c.get("text", "").strip()]
         if not raw_chunks:
             raise ValueError("File is empty or has no extractable text.")
 
-        # Remove the old version of this file
-        self.delete_file(name)
-
-        # Embed each chunk and build rows for LanceDB
+        # Embed each chunk and build rows for LanceDB (network I/O, outside lock)
         total = len(raw_chunks)
         rows = []
         for i, chunk in enumerate(raw_chunks):
@@ -441,12 +506,13 @@ class ChatbotDB:
                 print(f"[WARNING] skipping chunk {i}: {e}")
                 continue
             rows.append({
-                "text":     chunk["text"],
-                "source":   chunk["meta"]["source"],
-                "page":     chunk["meta"]["page"],
-                "chunk_id": chunk["meta"]["chunk_id"],
-                "heading":  chunk["meta"]["heading"],
-                "vector":   emb,
+                "text":      chunk["text"],
+                "source":    chunk["meta"]["source"],
+                "page":      chunk["meta"]["page"],
+                "chunk_id":  chunk["meta"]["chunk_id"],
+                "heading":   chunk["meta"]["heading"],
+                "file_path": str(Path(file_path).resolve()),
+                "vector":    emb,
             })
             if progress_cb and (i + 1) % 50 == 0:
                 progress_cb(i + 1, total)
@@ -457,17 +523,22 @@ class ChatbotDB:
         if not rows:
             raise ValueError("No chunks could be embedded.")
 
-        # Clear QA cache since document content changed
-        self.clear_qa_cache()
+        # ── Critical section: DB writes under lock ────────────────────────────
+        with self._write_lock:
+            # Remove the old version of this file
+            self._delete_file_unlocked(name)
 
-        # Add rows to LanceDB
-        if self._table is None:
-            self._create_table(rows)
-        else:
-            self._table.add(rows)
-            self._rebuild_fts()
+            # Clear QA cache since document content changed
+            self._clear_qa_cache_unlocked()
 
-        self._invalidate_cache()
+            # Add rows to LanceDB
+            if self._table is None:
+                self._create_table(rows)
+            else:
+                self._table.add(rows)
+                self._rebuild_fts()
+
+            self._invalidate_cache()
         return len(rows)
 
     # ── Scoring ───────────────────────────────────────────────────────────────
@@ -483,7 +554,7 @@ class ChatbotDB:
         if self._table is None:
             return []
 
-        where_clause = f"source = '{source_filter}'" if source_filter else None
+        where_clause = _where_source(source_filter) if source_filter else None
 
         try:
             # Try hybrid search first (vector + FTS)
@@ -518,10 +589,11 @@ class ChatbotDB:
             output.append({
                 "text": row["text"],
                 "meta": {
-                    "source":   row["source"],
-                    "page":     int(row["page"]),
-                    "chunk_id": int(row["chunk_id"]),
-                    "heading":  row["heading"],
+                    "source":    row["source"],
+                    "page":      int(row["page"]),
+                    "chunk_id":  int(row["chunk_id"]),
+                    "heading":   row["heading"],
+                    "file_path": row.get("file_path", ""),
                 },
                 "score": round(score, 4),
             })
@@ -533,7 +605,7 @@ class ChatbotDB:
         if self._table is None:
             return []
 
-        where_clause = f"source = '{source_filter}'" if source_filter else None
+        where_clause = _where_source(source_filter) if source_filter else None
 
         try:
             builder = self._table.search(
@@ -556,10 +628,11 @@ class ChatbotDB:
             output.append({
                 "text": row["text"],
                 "meta": {
-                    "source":   row["source"],
-                    "page":     int(row["page"]),
-                    "chunk_id": int(row["chunk_id"]),
-                    "heading":  row["heading"],
+                    "source":    row["source"],
+                    "page":      int(row["page"]),
+                    "chunk_id":  int(row["chunk_id"]),
+                    "heading":   row["heading"],
+                    "file_path": row.get("file_path", ""),
                 },
                 "score": round(score, 4),
             })
@@ -625,21 +698,33 @@ class ChatbotDB:
             return []
 
         if source_filter:
-            # Just return all chunks from the source in order
+            # Just return all chunks from the source in reading order.
+            # We fetch n_final+1 rows first to detect truncation and warn.
             try:
-                df = self._table.search().where(
-                    f"source = '{source_filter}'"
-                ).limit(n_final).to_pandas()
+                probe_df = self._table.search().where(
+                    _where_source(source_filter)
+                ).limit(n_final + 1).to_pandas()
+
+                if len(probe_df) > n_final:
+                    print(
+                        f"[WARNING] exhaustive_query: source '{source_filter}' has "
+                        f"more than {n_final} chunks; only the first {n_final} will be "
+                        "returned. Pass a larger n_final to retrieve the full document."
+                    )
+                    df = probe_df.iloc[:n_final]
+                else:
+                    df = probe_df
 
                 result = []
                 for _, row in df.iterrows():
                     result.append({
                         "text": row["text"],
                         "meta": {
-                            "source":   row["source"],
-                            "page":     int(row["page"]),
-                            "chunk_id": int(row["chunk_id"]),
-                            "heading":  row["heading"],
+                            "source":    row["source"],
+                            "page":      int(row["page"]),
+                            "chunk_id":  int(row["chunk_id"]),
+                            "heading":   row["heading"],
+                            "file_path": row.get("file_path", ""),
                         },
                         "score": 1.0,
                     })
@@ -648,8 +733,11 @@ class ChatbotDB:
                     x["meta"].get("chunk_id", 0),
                 ))
                 return result
-            except Exception:
-                # Fallback: filter from all chunks
+            except Exception as _eq_exc:
+                # Fallback: filter in Python from the cached chunk list.
+                # Log so this doesn't disappear silently.
+                print(f"[WARNING] exhaustive_query LanceDB scan failed ({_eq_exc}); "
+                      "falling back to in-memory chunk filter.")
                 all_c = self.chunks
                 result = [
                     {"text": c["text"], "meta": c["meta"], "score": 1.0}
@@ -714,26 +802,19 @@ class ChatbotDB:
         except Exception:
             return {}
 
-    def delete_file(self, name: str) -> bool:
-        """
-        Remove all chunks for the named file.
-        Uses LanceDB's native delete for efficiency.
-        Returns True if the file was found, False otherwise.
-        """
+    def _delete_file_unlocked(self, name: str) -> bool:
+        """Internal: delete file without acquiring lock (caller must hold _write_lock)."""
         if self._table is None:
             return False
         try:
-            # Check if file exists first
             existing = self.list_all()
             if name not in existing:
                 return False
 
-            self._table.delete(f"source = '{name}'")
+            self._table.delete(_where_source(name))
             self._rebuild_fts()
             self._invalidate_cache()
-            self.clear_qa_cache()   # Answers may reference deleted content
 
-            # If table is now empty, clean up
             remaining = self.list_all()
             if not remaining:
                 try:
@@ -746,6 +827,19 @@ class ChatbotDB:
         except Exception as e:
             print(f"[WARNING] delete_file error: {e}")
             return False
+
+    def delete_file(self, name: str) -> bool:
+        """
+        Remove all chunks for the named file.
+        Uses LanceDB's native delete for efficiency.
+        Thread-safe: acquires _write_lock.
+        Returns True if the file was found, False otherwise.
+        """
+        with self._write_lock:
+            result = self._delete_file_unlocked(name)
+            if result:
+                self._clear_qa_cache_unlocked()  # Answers may reference deleted content
+            return result
 
     def total_chunks(self) -> int:
         """Return the total number of indexed text chunks."""
@@ -772,6 +866,7 @@ class ChatbotDB:
         """
         Store a question-answer pair in the cache with the question's embedding.
         Future similar questions will get this answer instantly.
+        Thread-safe: acquires _write_lock for the DB write.
         """
         if not question.strip() or not answer.strip():
             return
@@ -785,12 +880,13 @@ class ChatbotDB:
                 "timestamp": datetime.now().isoformat(),
                 "vector":    emb,
             }
-            if self._qa_table is None:
-                self._qa_table = self._db.create_table(
-                    QA_TABLE_NAME, data=[row], schema=QA_SCHEMA, mode="overwrite"
-                )
-            else:
-                self._qa_table.add([row])
+            with self._write_lock:
+                if self._qa_table is None:
+                    self._qa_table = self._db.create_table(
+                        QA_TABLE_NAME, data=[row], schema=QA_SCHEMA, mode="overwrite"
+                    )
+                else:
+                    self._qa_table.add([row])
         except Exception as e:
             print(f"[INFO] QA cache store skipped: {e}")
 
@@ -815,7 +911,7 @@ class ChatbotDB:
                 q_emb, query_type="vector", vector_column_name="vector"
             )
             # Filter by source context
-            builder = builder.where(f"source = '{src}'")
+            builder = builder.where(f"source = '{_sanitise_source(src)}'")
             results = builder.limit(1).to_pandas()
 
             if results.empty:
@@ -834,14 +930,19 @@ class ChatbotDB:
         except Exception:
             return None
 
-    def clear_qa_cache(self):
-        """Clear the entire QA cache. Called when documents change."""
+    def _clear_qa_cache_unlocked(self):
+        """Internal: clear QA cache without lock (caller must hold _write_lock)."""
         try:
             if self._qa_table is not None:
                 self._db.drop_table(QA_TABLE_NAME)
                 self._qa_table = None
         except Exception:
             self._qa_table = None
+
+    def clear_qa_cache(self):
+        """Clear the entire QA cache. Called when documents change. Thread-safe."""
+        with self._write_lock:
+            self._clear_qa_cache_unlocked()
 
     def find_qa_examples(self, question: str, source_filter: str = None,
                          n: int = 2, min_similarity: float = 0.70) -> list:
@@ -864,7 +965,7 @@ class ChatbotDB:
             builder = self._qa_table.search(
                 q_emb, query_type="vector", vector_column_name="vector"
             )
-            builder = builder.where(f"source = '{src}'")
+            builder = builder.where(f"source = '{_sanitise_source(src)}'")
             results = builder.limit(n + 1).to_pandas()  # +1 to skip exact match
 
             if results.empty:
