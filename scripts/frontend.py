@@ -28,7 +28,12 @@ def _get_logo_src(path):
 
 logo_src = _get_logo_src(logo_path)
 
-ADMIN_PASSWORD = "Admin321!"
+# Load admin password from environment (do NOT hardcode)
+import sys, os as _os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "DefaultAdminPassword")
 
 # ── Multi-user connection management ──────────────────────────────────────────
 MAX_USERS = 5

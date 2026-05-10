@@ -1,11 +1,99 @@
-# Ignore the database folder
-document_db/
-
-# Ignore environment variables (crucial for security)
+# ============================================================================
+# SENSITIVE DATA & CONFIGURATION
+# ============================================================================
 .env
+.env.local
+.env.*.local
+config.ini
+config.json
+secrets/
+private/
 
-# Ignore Python cache
-__pycache__/
+# ============================================================================
+# DATABASE & CACHE
+# ============================================================================
+document_db/
+*.db
+*.sqlite
+*.sqlite3
+lancedb/
+.lancedb/
 
-# Ignore chat history
+# ============================================================================
+# CHAT HISTORY & USER DATA
+# ============================================================================
 chat_history/
+chat_sessions/
+uploads/
+temp/
+*.log
+
+# ============================================================================
+# PYTHON & DEPENDENCIES
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+.venv
+.env.local
+
+# ============================================================================
+# IDE & EDITOR
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================================
+# OS-SPECIFIC
+# ============================================================================
+.DS_Store
+Thumbs.db
+*.lnk
+
+# ============================================================================
+# TESTING & COVERAGE
+# ============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# ============================================================================
+# NODE (if applicable)
+# ============================================================================
+node_modules/
+npm-debug.log
+yarn-error.log
