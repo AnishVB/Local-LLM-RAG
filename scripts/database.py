@@ -1,22 +1,50 @@
 """
 database.py — Vector database for document chunks (LanceDB + PyMuPDF edition)
 
-Handles:
-  - PDF and TXT ingestion (extraction → cleaning → chunking)
-  - PDF extraction via PyMuPDF (fitz) — faster and more accurate than pdfplumber
-  - Embedding via Ollama (nomic-embed-text)
-  - LanceDB for persistent vector storage with hybrid search
-  - Full-text (BM25) + semantic (cosine) hybrid retrieval
-  - Source-filtered retrieval for doc-pinning mode
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT THIS FILE DOES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-FIXES (v2):
-  3. Space/time: removed redundant re-builds, reuse source index; lazy matrix build
+  PDF / TXT ingestion pipeline:
+    1. Extract text page-by-page via PyMuPDF (fitz) — 5-10× faster than pdfplumber
+    2. Clean text (strip non-printable chars, collapse whitespace, remove boilerplate)
+    3. Chunk each page into overlapping segments (≤ CHUNK_CHARS with OVERLAP_CHARS overlap)
+    4. Embed each chunk via Ollama nomic-embed-text (768-dim vectors)
+    5. Store chunks + vectors in LanceDB (Arrow IPC files on disk)
 
-PAGE NUMBER CONVENTION (important):
-  All "page" values stored in chunk metadata are 0-indexed integers
-  matching PyMuPDF's page numbering (first page = 0).
-  The display layer (frontend + chat_engine) adds 1 when showing to users.
-  This file never adds or subtracts 1 — it only stores what PyMuPDF gives.
+  Retrieval:
+    • Hybrid search: vector cosine similarity + BM25 full-text (Reciprocal Rank Fusion)
+    • Falls back to pure vector search if FTS index is unavailable
+    • Source-filtered queries use LanceDB WHERE clauses for efficiency
+
+  Caching:
+    • QA answer cache: similar questions reuse previous answers (threshold 0.93)
+    • LRU cache on embeddings (256 entries): cache hits skip Ollama entirely
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PAGE NUMBER CONVENTION  ← CRITICAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  All "page" values in chunk metadata are 0-indexed integers matching PyMuPDF
+  (first page = 0).  This file NEVER adds or subtracts 1 — it stores exactly
+  what PyMuPDF returns.
+
+  The display layer (chat_engine._build_ctx) adds +1 when embedding page
+  numbers into the [p.N] citation tags that the LLM uses in its answers.
+
+  Do NOT confuse physical page numbers with internal document section/paragraph
+  numbers (e.g. "clause 10.6").  Those are text content, not page metadata.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONCURRENCY (multi-user server)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Each ChatEngine (one per browser session) creates its own ChatbotDB, which
+    opens its own lancedb.connect() handle — reads are fully concurrent.
+  - _write_lock per instance serialises the short write window (add/delete)
+    without blocking concurrent readers.
+  - Embedding calls go to Ollama over HTTP and are inherently concurrent.
+  - lru_cache on _embed_cached is module-level, thread-safe in CPython.
 """
 
 import os
@@ -352,13 +380,16 @@ class ChatbotDB:
     Vector store backed by LanceDB with hybrid search capabilities.
 
     Key design points:
-      - Documents are stored as rows in a LanceDB table with text, metadata,
-        and embedding vectors.
-      - Hybrid search combines semantic (cosine) and full-text (BM25) retrieval
+      - Each instance opens its own lancedb.connect() handle so concurrent
+        readers (one per browser session) never block each other.
+      - _write_lock serialises write operations (add/delete) within one instance;
+        LanceDB's own commit protocol ensures on-disk consistency across instances.
+      - Hybrid search combines semantic (cosine) and full-text BM25 retrieval
         using LanceDB's built-in FTS support via Tantivy.
       - Source filtering uses LanceDB's native WHERE clause for efficiency.
       - The .chunks property provides backward-compatible access for
         chat_engine.py's section-walk and page-retrieval logic.
+        Results are cached and invalidated on writes.
     """
 
     def __init__(self):
@@ -437,6 +468,7 @@ class ChatbotDB:
         except Exception:
             return []
 
+    # ── Public write API ──────────────────────────────────────────────────────
     def add_file(self, file_path: str, progress_cb=None) -> int:
         """
         Ingest a new document (PDF or TXT):
@@ -640,6 +672,7 @@ class ChatbotDB:
 
     # ── Public query methods ──────────────────────────────────────────────────
 
+    # ── Public query API ──────────────────────────────────────────────────────
     def multi_query(self, queries: list, n_final: int = 20,
                     min_score: float = 0.10, max_per_page: int = 5,
                     source_filter: str = None) -> list:
@@ -849,6 +882,49 @@ class ChatbotDB:
             return self._table.count_rows()
         except Exception:
             return 0
+
+    def storage_size_mb(self) -> float:
+        """
+        Return the total on-disk size of the LanceDB directory in MB.
+        This covers all Lance fragment files, the vector index, and the FTS index,
+        giving a realistic picture of how much storage the indexed docs consume.
+        """
+        try:
+            total = sum(
+                f.stat().st_size
+                for f in Path(LANCE_DB_PATH).rglob("*")
+                if f.is_file()
+            )
+            return round(total / (1024 * 1024), 2)
+        except Exception:
+            return 0.0
+
+    def storage_size_by_source(self) -> dict:
+        """
+        Estimate per-document storage in MB based on each source's share of total
+        text bytes stored in the DB.  Proportional estimate — exact per-file Lance
+        sizes aren't exposed by the LanceDB API, so we use text length as a proxy.
+
+        Returns {source_name: mb_estimate}.
+        """
+        if self._table is None:
+            return {}
+        try:
+            df = self._table.to_pandas()[["source", "text"]]
+            if df.empty:
+                return {}
+            df["bytes"] = df["text"].str.len()
+            total_bytes = df["bytes"].sum()
+            if total_bytes == 0:
+                return {}
+            total_mb = self.storage_size_mb()
+            per_source = df.groupby("source")["bytes"].sum()
+            return {
+                src: round(float(b) / total_bytes * total_mb, 2)
+                for src, b in per_source.items()
+            }
+        except Exception:
+            return {}
 
     # ── QA Answer Cache ───────────────────────────────────────────────────────
 

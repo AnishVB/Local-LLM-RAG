@@ -1,10 +1,49 @@
 """
-chat_engine.py — RAG chat pipeline
-CHANGES:
-  - Issue 2: Numeric/financial value detection → lower threshold + wider retrieval
-  - Issue 3: Follow-ups removed from UI chips; instead appended inline at end of answer
-  - Issue 4: Multi-section ambiguity detection → bot asks user to pick a section
-  - Issue 5: Vague follow-up detection ("explain in detail" etc.) → anchor to last Q&A only
+chat_engine.py — RAG (Retrieval-Augmented Generation) chat pipeline
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PAGE NUMBER CONVENTION  ← READ THIS CAREFULLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Storage (database.py) : 0-indexed  (PyMuPDF page 0 = first physical page)
+  Display to users      : 1-indexed  (we always add +1 before showing)
+
+  Each chunk is tagged [PAGE:N] in the prompt (N = 0-indexed DB page + 1).
+  The LLM is instructed to cite as (Page N) using that tag's number only.
+  _build_ctx() does the +1. Nowhere else should page numbers be adjusted.
+
+  ⚠️  Why [PAGE:N] instead of [p.N]:
+  Documents like procurement manuals use internal numbering like '4.18',
+  '8.16', 'p.35' for PARAGRAPH and CLAUSE identifiers — not physical pages.
+  The old [p.N] tag was visually identical, so the LLM would cite clause
+  numbers as page refs (e.g. '(p.4.18)'). The new [PAGE:N] format is
+  unmistakably distinct. Internal refs appear verbatim in content only.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONCURRENCY NOTES (multi-user server)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Each browser session gets its own ChatEngine instance (created in
+    _get_engine_for_session in frontend.py) so LanceDB connections are never
+    shared across users — reads are fully concurrent.
+  - _call / _call_stream are stateless module-level functions — safe to call
+    from multiple threads simultaneously; Ollama queues / parallelises them.
+  - Set OLLAMA_NUM_PARALLEL=4 (or higher) in your environment before launching
+    the server so Ollama runs requests in parallel instead of serialising them.
+  - Background subtasks (follow-up suggestions, LLM reranking) run in the
+    module-level _BG_POOL (ThreadPoolExecutor, max 8 workers) to prevent
+    unbounded thread creation under concurrent load.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ISSUES RESOLVED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Issue 2: Numeric/financial queries → lower min_score + wider retrieval window
+  Issue 3: Follow-up chips removed from UI; now appended inline at answer end
+  Issue 4: Multi-section ambiguity → bot asks user to pick a section to focus on
+  Issue 5: Vague follow-ups ("explain in detail") → anchor to previous Q&A only
+  Issue 6: Page vs clause/section citation confusion → DOC_SYSTEM prompt now
+           explicitly distinguishes (p.N) from internal document numbering
 """
 import os, sys, re, json, threading
 import ollama
@@ -12,6 +51,11 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+
+# ── Module-level background thread pool ───────────────────────────────────────
+# Shared across all ChatEngine instances.  Limits background work (suggestions,
+# rerank) to at most 8 concurrent threads total — prevents thread storms under load.
+_BG_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="rag_bg")
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(current_dir))
@@ -22,7 +66,7 @@ load_dotenv(os.path.join(os.path.dirname(current_dir), ".env"))
 MODEL    = os.getenv("MODEL_NAME", "gemma4:e2b")
 MAX_HIST = 8
 NUM_GPU  = int(os.getenv("NUM_GPU", "1"))  # Set to 0 for CPU-only, 1+ if you have VRAM
-NUM_THREAD = int(os.getenv("NUM_THREAD", "4"))  # 4 threads — let mlock/RAM do the heavy lifting, saves CPU for other processes
+NUM_THREAD = int(os.getenv("NUM_THREAD") or "6")  # n threads — let mlock/RAM do the heavy lifting, saves CPU for other processes
 
 CHUNK_CAP_NORMAL = 12
 CHUNK_CAP_LIST   = 30
@@ -89,13 +133,27 @@ _NUMERIC_QUERY_RE = re.compile(
 )
 
 # ── Issue 4: Multi-section ambiguity detection ────────────────────────────────
-# Thresholds are intentionally high — annual reports legitimately repeat topics
-# across many pages. Only fire when sections are truly about different subjects.
+# Only fires when context spans BOTH many headings AND many pages simultaneously.
+# Comparison/summary queries are explicitly excluded — they need cross-doc data.
 _MIN_SECTIONS_FOR_AMBIGUITY = 8   # distinct non-boilerplate headings
-_MIN_PAGES_FOR_AMBIGUITY    = 12  # distinct pages (very high — financial data spans the whole doc)
+_MIN_PAGES_FOR_AMBIGUITY    = 12  # distinct pages
 
+# Queries that intentionally need data from across the whole document —
+# never ask for clarification on these even if context spans many sections.
+_CROSS_DOC_RE = re.compile(
+    r'\b(compare|comparison|versus|vs\.?|difference(s)? between|contrast'
+    r'|similarities|pros and cons|which is better|how do .+ differ'
+    r'|summarize|summarise|overview|all of them|list all|give me all'
+    r'|across (all|the) (document|sections?|pages?)'
+    r'|what (are|were) (all|the) .+(s)\b)\b',
+    re.IGNORECASE
+)
+
+
+# ── Fast-path helpers ────────────────────────────────────────────────────────
 
 def _is_pure_greeting(text):
+    """Return True if the message is a greeting/social phrase that needs no document lookup."""
     low = text.strip().lower()
     if low in _HARD_CASUAL_PHRASES: return True
     words = low.split()
@@ -105,7 +163,10 @@ def _is_pure_greeting(text):
 
 
 def _is_vague_followup(text):
-    """Issue 5: detect short vague follow-ups that should anchor to the last answer."""
+    """
+    Issue 5: Detect short vague follow-ups ("explain more", "in detail" etc.)
+    that should expand the PREVIOUS answer rather than trigger a fresh search.
+    """
     stripped = text.strip()
     if len(stripped.split()) > 12:
         return False   # longer questions are specific enough
@@ -113,7 +174,7 @@ def _is_vague_followup(text):
 
 
 def _is_detail_request(text):
-    """Detect when user explicitly asks for a detailed/comprehensive answer."""
+    """Detect when user explicitly asks for a detailed/comprehensive answer (standalone question, not a follow-up)."""
     return bool(_DETAIL_REQUEST_RE.search(text))
 
 
@@ -129,6 +190,7 @@ def _context_is_ambiguous(context, query):
 
     NOT triggered for:
       - Numeric/financial queries (data legitimately appears across the whole doc)
+      - Comparison/summary queries ("compare X and Y", "summarise", "vs", etc.)
       - Queries where headings are just boilerplate or page numbers
       - Queries where all headings are essentially the same topic
     Returns [] if not ambiguous.
@@ -136,9 +198,13 @@ def _context_is_ambiguous(context, query):
     if not context:
         return []
 
-    # Never ask for clarification on financial/numeric queries — these intentionally
-    # aggregate data from across the document (tables, notes, schedules, etc.)
+    # Never clarify on financial/numeric queries
     if _is_numeric_query(query):
+        return []
+
+    # Never clarify on comparison or cross-document queries — these intentionally
+    # pull from many sections (e.g. "compare the torpedos", "summarise all products")
+    if _CROSS_DOC_RE.search(query):
         return []
 
     # Collect only non-boilerplate, substantively different headings
@@ -151,15 +217,15 @@ def _context_is_ambiguous(context, query):
             real_headings.add(h.lower()[:60])
         distinct_pages.add(c["meta"].get("page", 0))
 
-    # Only trigger if there are many genuinely different section headings
-    if (len(real_headings) >= _MIN_SECTIONS_FOR_AMBIGUITY or
+    # Only trigger when BOTH thresholds are met (AND, not OR) —
+    # prevents firing on broad but clear queries that span many pages
+    if (len(real_headings) >= _MIN_SECTIONS_FOR_AMBIGUITY and
             len(distinct_pages) >= _MIN_PAGES_FOR_AMBIGUITY):
         sections = []
         seen = set()
         for c in context:
             h = (c["meta"].get("heading") or "").strip()
             p = c["meta"].get("page", 0) + 1
-            # Skip boilerplate headings in the displayed list
             if h and _is_boilerplate_heading(h):
                 continue
             label = h if h else f"Page {p}"
@@ -172,6 +238,17 @@ def _context_is_ambiguous(context, query):
 
 
 # ── System prompts ────────────────────────────────────────────────────────────
+# DOC_SYSTEM: used when we have document excerpts to ground the answer.
+#
+# WHY [PAGE:N] TAGS (not [p.N]):
+#   Many documents use internal numbering like "4.18", "8.16", "p.35" for
+#   PARAGRAPHS or CLAUSES. The old [p.N] tag looked identical to these, so
+#   the LLM would cite a clause number as if it were a page (e.g. "(p.4.18)").
+#
+#   Fix: chunks are now tagged [PAGE:N] — visually unmistakable from any
+#   decimal clause/paragraph number. The LLM cites as (Page N).
+#   Internal doc numbering is reproduced verbatim in text, never as (Page N).
+#
 DOC_SYSTEM = (
     "You are a knowledgeable assistant with access to uploaded documents. "
     "Match your answer length to the complexity of the question: "
@@ -180,8 +257,18 @@ DOC_SYSTEM = (
     "Do NOT pad answers with unnecessary context, definitions, or implications unless asked. "
     "IMPORTANT: Always include ALL specific numbers, figures, percentages, dates, and monetary values "
     "mentioned in the excerpts — never omit numerical data. "
-    "Cite pages like (p.N). If excerpts don't fully cover a point, say so, then supplement "
-    "with your own knowledge in a section using a '---' divider followed by '## AI SUMMARY' as a heading. "
+    "HOW TO CITE SOURCES: "
+    "Each excerpt is prefixed with a tag like [PAGE:47]. "
+    "When you cite a source, write (Page 47) using the number from that [PAGE:N] tag ONLY. "
+    "NEVER treat numbers that appear inside the excerpt text as page numbers. "
+    "Documents have internal numbering — clause numbers like '4.18' or '10.6', "
+    "paragraph numbers like 'para 3.2', section numbers — these are NOT page numbers. "
+    "Reproduce internal numbering verbatim as content, but do NOT cite it as (Page N). "
+    "Example: excerpt tagged [PAGE:82] contains text 'clause 10.6 states the fee is non-refundable'. "
+    "Correct citation: 'The fee is non-refundable per clause 10.6 (Page 82).' "
+    "Wrong citation: '(p.10.6)' or '(p.82.10)' or '(p.4.18)'. "
+    "If excerpts don't fully cover a point, say so, then supplement "
+    "with your own knowledge in a section using a '---' divider followed by '## SUMMARY' as a heading. "
     "Never refuse to answer.\n"
 )
 
@@ -285,19 +372,37 @@ def _ollama_error_msg(e: Exception) -> str:
     return f"[Error: {e}]"
 
 def _call(prompt, opts=None):
+    """Single-shot LLM call (classification, rerank, suggestions). Thread-safe."""
     try:
         return ollama.generate(model=MODEL, prompt=prompt, options=opts or CLASSIFY_OPTS).get("response", "").strip()
     except Exception as e: return _ollama_error_msg(e)
 
-def _call_stream(prompt, opts=None, callback=None):
+def _call_stream(prompt, opts=None, callback=None, stop_event=None):
+    """
+    Streaming LLM call.  Tokens are pushed to `callback(token)` as they arrive.
+    If `stop_event` is set mid-stream the generator loop exits early, leaving
+    Ollama to drain the rest of the response on its own — other users are
+    unaffected because Ollama handles each request independently.
+    Thread-safe: multiple concurrent calls are fine (Ollama queues them when
+    OLLAMA_NUM_PARALLEL=1, runs them in parallel when set higher).
+    """
     try:
         full = []
         for chunk in ollama.generate(model=MODEL, prompt=prompt, stream=True, options=opts or ANSWER_OPTS):
+            # Check per-request stop signal (user clicked "Stop") — bail early
+            if stop_event and stop_event.is_set():
+                break
             t = chunk.get("response", "")
-            if t: full.append(t); callback and callback(t)
+            if t:
+                full.append(t)
+                if callback:
+                    callback(t)
         return "".join(full).strip()
     except Exception as e:
-        err = _ollama_error_msg(e); callback and callback(err); return err
+        err = _ollama_error_msg(e)
+        if callback:
+            callback(err)
+        return err
 
 def _json_list(raw):
     s, e = raw.find("["), raw.rfind("]")
@@ -410,6 +515,12 @@ def _get_section(db, anchor_chunks, source_filter=None):
     return section if section else anchor_chunks
 
 def _search(db, text, history, source_filter=None, precomputed_queries=None, numeric_boost=False):
+    """
+    Standard document retrieval using hybrid vector + BM25 search.
+    numeric_boost=True lowers the similarity threshold and returns more chunks
+    per page — needed for tables and short numeric lines that embed with lower
+    cosine similarity than prose.
+    """
     queries = [text] + (precomputed_queries or _fast_rewrite(text))
     # Issue 2: for numeric queries, lower min_score and raise max_per_page to catch
     # table rows and short numeric lines that embed with lower cosine similarity
@@ -426,6 +537,12 @@ def _search_section(db, text, history, source_filter=None, precomputed_queries=N
     return _get_section(db, anchors, source_filter)
 
 def _rerank(query, chunks, n_keep=8):
+    """
+    Use the LLM to rerank the top retrieval candidates by relevance.
+    Falls back to top-N by score if the LLM returns malformed JSON.
+    Only called when initial retrieval returns >6 chunks to avoid unnecessary
+    LLM calls for small result sets.
+    """
     if len(chunks) <= n_keep: return chunks
     previews = [f"{i}: {c['text'][:200].replace(chr(10),' ').strip()}" for i, c in enumerate(chunks)]
     raw = _call(
@@ -448,7 +565,10 @@ def _rerank(query, chunks, n_keep=8):
     return chunks[:n_keep]
 
 # ── Context / prompt builders ─────────────────────────────────────────────────
+# ── Context / prompt builders ─────────────────────────────────────────────────
+
 def _hist_block(history, max_pairs=None):
+    """Format the conversation history into a text block for the prompt."""
     if not history: return ""
     limit = (max_pairs * 2) if max_pairs else (MAX_HIST * 2)
     lines = [f'{"User" if m["role"]=="user" else "Assistant"}: {m["content"][:250]}'
@@ -456,13 +576,27 @@ def _hist_block(history, max_pairs=None):
     return "PRIOR CONVERSATION:\n" + "\n".join(lines) + "\n\n"
 
 def _build_ctx(chunks, cap=CHUNK_CAP_NORMAL):
+    """
+    Build the context block fed into the LLM prompt.
+
+    Groups chunks by source document, sorts within each document by page then
+    chunk order, and prefixes every chunk with a [PAGE:N] tag where N is the
+    1-indexed physical page number (stored value + 1).
+
+    The [PAGE:N] tag is what the LLM uses to produce "(Page N)" citations in
+    its answers. It always reflects the PHYSICAL page of the PDF — never an
+    internal clause or paragraph number that may appear in the chunk text.
+    """
     by_src = defaultdict(list)
     for c in chunks[:cap]: by_src[c["meta"]["source"]].append(c)
     parts = []
     for src, cs in by_src.items():
         cs.sort(key=lambda x: (x["meta"].get("page", 0), x["meta"].get("chunk_id", 0)))
         parts.append(f"--- {src} ---")
-        for c in cs: parts.append(f"[p.{c['meta'].get('page', 0) + 1}] {c['text']}")
+        for c in cs:
+            # page is 0-indexed in DB; add 1 for the user-facing citation tag
+            display_page = c["meta"].get("page", 0) + 1
+            parts.append(f"[PAGE:{display_page}] {c['text']}")
     return "\n".join(parts)
 
 def _prompt_doc(q, ctx, hist, is_list=False, qa_examples=None, is_numeric=False, is_detail=False):
@@ -476,16 +610,16 @@ def _prompt_doc(q, ctx, hist, is_list=False, qa_examples=None, is_numeric=False,
     if is_list:
         task = (
             "Extract every relevant item from the excerpts. Copy exact wording. Number each item. "
-            "Cite page as (p.N). Cover ALL excerpts. After listing, give a brief count. "
+            "Cite the source page as (Page N) using the [PAGE:N] tag number only — never use clause or paragraph numbers as page citations. Cover ALL excerpts. After listing, give a brief count. "
             "If excerpts are from multiple documents, group by document name.\n"
         )
     elif is_detail:
         task = (
             "Give a DETAILED and COMPREHENSIVE answer — the user has explicitly asked for depth. Follow this order:\n"
-            "1. Use exact terms, figures, names, dates from the excerpts and cite with (p.N).\n"
+            "1. Use exact terms, figures, names, dates from the excerpts. Cite the physical page as (Page N) using only the number from the [PAGE:N] tag before the excerpt.\n"
             "2. Expand on ALL relevant aspects: definitions, procedures, conditions, exceptions, examples, implications.\n"
             "3. If the excerpts cover the topic partially or not at all, say so, then add a section:\n"
-            "   \n---\n## AI SUMMARY\n"
+            "   \n---\n##SUMMARY\n"
             "   (your general knowledge answer here)\n"
             "4. If excerpts come from multiple documents, group information under each document name.\n"
         )
@@ -494,9 +628,9 @@ def _prompt_doc(q, ctx, hist, is_list=False, qa_examples=None, is_numeric=False,
             "Answer the question directly and concisely. Follow this order:\n"
             "1. If the question is simple or factual, answer in 1-3 sentences — do NOT pad.\n"
             "2. If the question is complex, give a structured answer covering all relevant aspects.\n"
-            "3. Always include exact terms, figures, names, dates from the excerpts and cite with (p.N).\n"
+            "3. Always include exact terms, figures, names, dates from the excerpts. Cite as (Page N) using the [PAGE:N] tag number only — never use internal clause or paragraph numbers as page citations.\n"
             "4. If the excerpts don't fully cover the topic, say so, then add a section:\n"
-            "   \n---\n## AI SUMMARY\n"
+            "   \n---\n##SUMMARY\n"
             "   (your general knowledge answer here)\n"
             "5. If excerpts come from multiple documents, group information under each document name.\n"
         )
@@ -518,7 +652,7 @@ def _prompt_no_ctx(q, hist, source_filter=None):
     return (GENERAL_SYSTEM + "\n" + preamble
             + "Tell the user briefly that this wasn't found in the document(s). "
             "Then answer from your general knowledge under a section:\n"
-            "\n---\n## AI SUMMARY\n(your answer here)\n"
+            "\n---\n##SUMMARY\n(your answer here)\n"
             "Keep it concise unless the topic genuinely requires depth.\n\n"
             + hist + f"QUESTION: {q}\n\nANSWER:\n")
 
@@ -649,6 +783,10 @@ class ChatSession:
         self.updated_at = datetime.now().isoformat()
         self.active_doc = None
 
+    @property
+    def is_empty(self):
+        return len(self.messages) == 0
+
     def add_message(self, role, content):
         self.messages.append({"role": role, "content": content})
         self.updated_at = datetime.now().isoformat()
@@ -745,36 +883,43 @@ def _find_past_answer(query, current_history):
     return None
 
 
-# ── Issue 1: Auto-delete empty sessions older than 1 hour ────────────────────
-def purge_empty_sessions(sessions):
+# ── Auto-delete empty sessions after 5 minutes of inactivity ─────────────────
+EMPTY_SESSION_TTL = 300  # seconds — empty chats older than this are removed
+
+def purge_empty_sessions(sessions, grace_seconds=EMPTY_SESSION_TTL):
     """
-    Remove sessions that have no messages and were created more than 1 hour ago.
+    Remove sessions that have no messages and were created more than
+    `grace_seconds` ago (default: 5 minutes).
+    Any empty session idle longer than the TTL is silently dropped.
+    A user who just logged in has a full 5-minute window before their
+    blank session is cleaned up, so this never races against a concurrent login.
     Returns the cleaned session list.
     """
-    cutoff = datetime.now().timestamp() - 3600   # 1 hour in seconds
+    cutoff = datetime.now().timestamp() - grace_seconds
     cleaned = []
     for s in sessions:
         if s.messages:
             cleaned.append(s)
             continue
-        # Parse creation time; if unparseable keep the session to be safe
         try:
             created_ts = datetime.fromisoformat(s.created_at).timestamp()
         except Exception:
-            cleaned.append(s)
+            cleaned.append(s)   # unparseable — keep to be safe
             continue
         if created_ts > cutoff:
-            cleaned.append(s)   # still within grace period
-        # else: drop it silently
+            cleaned.append(s)   # still within grace window
+        # else: older than TTL with no messages — drop silently
     return cleaned
 
 
 # ── ChatEngine ────────────────────────────────────────────────────────────────
 class ChatEngine:
     def __init__(self):            self.db = ChatbotDB()
-    def get_model_name(self):      return MODEL
-    def get_chunk_count(self):     return self.db.total_chunks()
-    def list_documents(self):      return self.db.list_all()
+    def get_model_name(self):           return MODEL
+    def get_chunk_count(self):          return self.db.total_chunks()
+    def list_documents(self):           return self.db.list_all()
+    def get_storage_mb(self):           return self.db.storage_size_mb()
+    def get_storage_by_source(self):    return self.db.storage_size_by_source()
     def delete_document(self, n):  return self.db.delete_file(n)
 
     def upload_file(self, path, progress_cb=None):
@@ -785,7 +930,14 @@ class ChatEngine:
         except Exception as e:    return False, f"Failed: {e}"
 
     def process_message(self, user_text, history, stream_cb=None, followup_cb=None,
-                        source_filter=None, last_answer=""):
+                        source_filter=None, last_answer="", stop_event=None):
+        """
+        Process one user message and stream the answer back via stream_cb.
+
+        stop_event (threading.Event): when set by the frontend (user clicked Stop),
+            the streaming loop in _call_stream exits early.  Other users' concurrent
+            requests are completely unaffected — each has its own stop_event.
+        """
         raw = user_text.strip()
         if not raw: return "", []
         low = raw.lower()
@@ -800,7 +952,7 @@ class ChatEngine:
             )
             answer = _call_stream(
                 SYSTEM + f'\nThe user said: "{raw}". Reply warmly in 1-2 sentences.' + doc_mention,
-                opts=CASUAL_OPTS, callback=stream_cb,
+                opts=CASUAL_OPTS, callback=stream_cb, stop_event=stop_event,
             )
             if not answer or len(answer.strip()) < 3:
                 fallbacks = {"hi": "Hi there! I'm your document assistant.",
@@ -853,14 +1005,15 @@ class ChatEngine:
                                  numeric_boost=_is_numeric_query(anchor_query))
             ctx = _build_ctx(ctx_chunks) if ctx_chunks else ""
             prompt = _prompt_vague_followup(raw, last_user_q, last_bot_ans, ctx, source_filter)
-            answer = _call_stream(prompt, opts=ANSWER_OPTS, callback=stream_cb) if stream_cb else _call(prompt, opts=ANSWER_OPTS)
+            answer = (_call_stream(prompt, opts=ANSWER_OPTS, callback=stream_cb, stop_event=stop_event)
+                      if stream_cb else _call(prompt, opts=ANSWER_OPTS))
 
-            # Inline suggestions for vague follow-ups too
+            # Inline suggestions for vague follow-ups — submitted to shared pool
             if followup_cb and answer and not answer.startswith("[Error"):
-                def _bg_vague_fu():
-                    suggestions = _generate_inline_suggestions(anchor_query, answer, ctx_chunks, source_filter)
+                def _bg_vague_fu(_ans=answer, _ctx=ctx_chunks, _src=source_filter, _aq=anchor_query):
+                    suggestions = _generate_inline_suggestions(_aq, _ans, _ctx, _src)
                     followup_cb(suggestions)
-                threading.Thread(target=_bg_vague_fu, daemon=True).start()
+                _BG_POOL.submit(_bg_vague_fu)
             else:
                 followup_cb and followup_cb([])
 
@@ -937,15 +1090,15 @@ class ChatEngine:
         else:
             prompt = _prompt_general(raw, hist)
 
-        answer = _call_stream(prompt, opts=ANSWER_OPTS, callback=stream_cb) if stream_cb else _call(prompt, opts=ANSWER_OPTS)
+        answer = (_call_stream(prompt, opts=ANSWER_OPTS, callback=stream_cb, stop_event=stop_event)
+                  if stream_cb else _call(prompt, opts=ANSWER_OPTS))
 
         if doc_directed and answer and not answer.startswith("[Error"):
             try: self.db.cache_qa(raw, answer, source_filter)
             except Exception: pass
 
-        # ── Issue 3: Inline suggestions (background thread) ───────────────────
-        # Instead of UI chips, generate suggestions and pass them back via followup_cb
-        # The frontend will append them inline to the answer text.
+        # ── Issue 3: Inline suggestions via shared background pool ────────────
+        # Using _BG_POOL (not bare threads) caps total background workers under load.
         if followup_cb and answer and not answer.startswith("[Error"):
             captured_answer   = answer
             captured_question = raw
@@ -956,15 +1109,14 @@ class ChatEngine:
                 last_page = max(c["meta"].get("page", 0) for c in context[:cap])
                 next_page_hint = f"Continue to page {last_page + 2}"
 
-            def _bg_suggestions():
-                suggestions = _generate_inline_suggestions(
-                    captured_question, captured_answer, captured_context,
-                    source_filter=captured_source
-                )
-                if list_mode and next_page_hint:
-                    suggestions = ([next_page_hint] + [s for s in suggestions if next_page_hint not in s])[:3]
+            def _bg_suggestions(_ans=captured_answer, _q=captured_question,
+                                 _src=captured_source, _ctx=captured_context,
+                                 _nph=next_page_hint):
+                suggestions = _generate_inline_suggestions(_q, _ans, _ctx, source_filter=_src)
+                if list_mode and _nph:
+                    suggestions = ([_nph] + [s for s in suggestions if _nph not in s])[:3]
                 followup_cb(suggestions)
-            threading.Thread(target=_bg_suggestions, daemon=True).start()
+            _BG_POOL.submit(_bg_suggestions)
         else:
             followup_cb and followup_cb([])
 
